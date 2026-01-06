@@ -2,7 +2,9 @@ package fsfuse
 
 import (
 	"errors"
+	"io"
 	"io/fs"
+	"log/slog"
 	"os/user"
 	"strconv"
 	"syscall"
@@ -50,6 +52,24 @@ func TestNew(t *testing.T) {
 	}
 	if n.fsys != mfs {
 		t.Error("New did not set fsys correctly")
+	}
+}
+
+func TestNew_WithLogger(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mfs := cmockfs.NewMockFileSystem(ctrl)
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	inodeEmbedder := New(mfs, Logger(logger))
+	if inodeEmbedder == nil {
+		t.Error("New returned nil")
+	}
+	n, ok := inodeEmbedder.(*node)
+	if !ok {
+		t.Fatal("New did not return *node")
+	}
+	if n.logger != logger {
+		t.Error("New did not set logger correctly")
 	}
 }
 

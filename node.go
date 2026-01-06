@@ -2,6 +2,7 @@ package fsfuse
 
 import (
 	"context"
+	"log/slog"
 	"path"
 	"strconv"
 	"syscall"
@@ -14,8 +15,9 @@ import (
 
 type node struct {
 	fs.Inode
-	fsys contextual.FS
-	path string
+	fsys   contextual.FS
+	path   string
+	logger *slog.Logger
 }
 
 // Ensure node implements various FUSE node interfaces.
@@ -48,7 +50,11 @@ func (n *node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 
 	fi, err := contextual.Lstat(ctx, n.fsys, n.path)
 	if err != nil {
-		return toErrno(err)
+		errno := toErrno(err)
+		if errno != syscall.ENOENT {
+			n.logger.Error("Getattr failed", "path", n.path, "error", err)
+		}
+		return errno
 	}
 	statToAttr(fi, &out.Attr)
 	return 0
@@ -60,14 +66,19 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	childPath := path.Join(n.path, name)
 	fi, err := contextual.Lstat(ctx, n.fsys, childPath)
 	if err != nil {
-		return nil, toErrno(err)
+		errno := toErrno(err)
+		if errno != syscall.ENOENT {
+			n.logger.Error("Lookup failed", "path", childPath, "error", err)
+		}
+		return nil, errno
 	}
 
 	statToAttr(fi, &out.Attr)
 
 	child := &node{
-		fsys: n.fsys,
-		path: childPath,
+		fsys:   n.fsys,
+		path:   childPath,
+		logger: n.logger,
 	}
 
 	id := fs.StableAttr{
@@ -83,6 +94,7 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	entries, err := contextual.ReadDir(ctx, n.fsys, n.path)
 	if err != nil {
+		n.logger.Error("Readdir failed", "path", n.path, "error", err)
 		return nil, toErrno(err)
 	}
 
@@ -102,9 +114,10 @@ func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	f, err := contextual.OpenFile(ctx, n.fsys, n.path, int(flags), 0)
 	if err != nil {
+		n.logger.Error("Open failed", "path", n.path, "error", err)
 		return nil, 0, toErrno(err)
 	}
-	return &fileHandle{f: f}, fuse.FOPEN_KEEP_CACHE, 0
+	return &fileHandle{f: f, logger: n.logger}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 // Create creates a new file in the directory and opens it.
@@ -113,11 +126,13 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	childPath := path.Join(n.path, name)
 	f, err := contextual.OpenFile(ctx, n.fsys, childPath, int(flags)|syscall.O_CREAT, toFileMode(mode))
 	if err != nil {
+		n.logger.Error("Create failed", "path", childPath, "error", err)
 		return nil, nil, 0, toErrno(err)
 	}
 
 	fi, err := f.Stat()
 	if err != nil {
+		n.logger.Error("Create: stat failed", "path", childPath, "error", err)
 		_ = f.Close()
 		return nil, nil, 0, toErrno(err)
 	}
@@ -125,8 +140,9 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	statToAttr(fi, &out.Attr)
 
 	child := &node{
-		fsys: n.fsys,
-		path: childPath,
+		fsys:   n.fsys,
+		path:   childPath,
+		logger: n.logger,
 	}
 
 	id := fs.StableAttr{
@@ -134,7 +150,7 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 		Ino:  out.Ino,
 	}
 
-	return n.NewInode(ctx, child, id), &fileHandle{f: f}, fuse.FOPEN_KEEP_CACHE, 0
+	return n.NewInode(ctx, child, id), &fileHandle{f: f, logger: n.logger}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 // Mkdir creates a new directory.
@@ -142,19 +158,22 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 	childPath := path.Join(n.path, name)
 	err := contextual.Mkdir(ctx, n.fsys, childPath, toFileMode(mode))
 	if err != nil {
+		n.logger.Error("Mkdir failed", "path", childPath, "error", err)
 		return nil, toErrno(err)
 	}
 
 	fi, err := contextual.Lstat(ctx, n.fsys, childPath)
 	if err != nil {
+		n.logger.Error("Mkdir: lstat failed", "path", childPath, "error", err)
 		return nil, toErrno(err)
 	}
 
 	statToAttr(fi, &out.Attr)
 
 	child := &node{
-		fsys: n.fsys,
-		path: childPath,
+		fsys:   n.fsys,
+		path:   childPath,
+		logger: n.logger,
 	}
 
 	id := fs.StableAttr{
@@ -167,12 +186,22 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 
 // Unlink removes a file.
 func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
-	return toErrno(contextual.Remove(ctx, n.fsys, path.Join(n.path, name)))
+	target := path.Join(n.path, name)
+	err := contextual.Remove(ctx, n.fsys, target)
+	if err != nil {
+		n.logger.Error("Unlink failed", "path", target, "error", err)
+	}
+	return toErrno(err)
 }
 
 // Rmdir removes a directory.
 func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
-	return toErrno(contextual.Remove(ctx, n.fsys, path.Join(n.path, name)))
+	target := path.Join(n.path, name)
+	err := contextual.Remove(ctx, n.fsys, target)
+	if err != nil {
+		n.logger.Error("Rmdir failed", "path", target, "error", err)
+	}
+	return toErrno(err)
 }
 
 // Symlink creates a symbolic link.
@@ -180,19 +209,22 @@ func (n *node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 	childPath := path.Join(n.path, name)
 	err := contextual.Symlink(ctx, n.fsys, target, childPath)
 	if err != nil {
+		n.logger.Error("Symlink failed", "path", childPath, "target", target, "error", err)
 		return nil, toErrno(err)
 	}
 
 	fi, err := contextual.Lstat(ctx, n.fsys, childPath)
 	if err != nil {
+		n.logger.Error("Symlink: lstat failed", "path", childPath, "error", err)
 		return nil, toErrno(err)
 	}
 
 	statToAttr(fi, &out.Attr)
 
 	child := &node{
-		fsys: n.fsys,
-		path: childPath,
+		fsys:   n.fsys,
+		path:   childPath,
+		logger: n.logger,
 	}
 
 	id := fs.StableAttr{
@@ -207,6 +239,7 @@ func (n *node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 func (n *node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 	link, err := contextual.ReadLink(ctx, n.fsys, n.path)
 	if err != nil {
+		n.logger.Error("Readlink failed", "path", n.path, "error", err)
 		return nil, toErrno(err)
 	}
 	return []byte(link), 0
@@ -228,7 +261,11 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 	oldPath := path.Join(n.path, name)
 	newPath := path.Join(targetNode.path, newName)
 
-	return toErrno(contextual.Rename(ctx, n.fsys, oldPath, newPath))
+	err := contextual.Rename(ctx, n.fsys, oldPath, newPath)
+	if err != nil {
+		n.logger.Error("Rename failed", "oldPath", oldPath, "newPath", newPath, "error", err)
+	}
+	return toErrno(err)
 }
 
 // Setattr changes the attributes of the file (chmod, chown, utimes, truncate).
@@ -254,7 +291,11 @@ func (n *node) chmod(ctx context.Context, in *fuse.SetAttrIn) syscall.Errno {
 	if !ok {
 		return 0
 	}
-	return toErrno(contextual.Chmod(ctx, n.fsys, n.path, toFileMode(mode)))
+	err := contextual.Chmod(ctx, n.fsys, n.path, toFileMode(mode))
+	if err != nil {
+		n.logger.Error("Chmod failed", "path", n.path, "error", err)
+	}
+	return toErrno(err)
 }
 
 func (n *node) chown(ctx context.Context, in *fuse.SetAttrIn) syscall.Errno {
@@ -273,7 +314,11 @@ func (n *node) chown(ctx context.Context, in *fuse.SetAttrIn) syscall.Errno {
 	if gidOk {
 		gStr = strconv.FormatUint(uint64(gid), 10)
 	}
-	return toErrno(contextual.Lchown(ctx, n.fsys, n.path, uStr, gStr))
+	err := contextual.Lchown(ctx, n.fsys, n.path, uStr, gStr)
+	if err != nil {
+		n.logger.Error("Chown failed", "path", n.path, "error", err)
+	}
+	return toErrno(err)
 }
 
 func (n *node) chtimes(ctx context.Context, in *fuse.SetAttrIn) syscall.Errno {
@@ -295,6 +340,7 @@ func (n *node) chtimes(ctx context.Context, in *fuse.SetAttrIn) syscall.Errno {
 	if !mtimeOk || !atimeOk {
 		fi, err := contextual.Lstat(ctx, n.fsys, n.path)
 		if err != nil {
+			n.logger.Error("Chtimes: lstat failed", "path", n.path, "error", err)
 			return toErrno(err)
 		}
 		if !mtimeOk {
@@ -306,7 +352,11 @@ func (n *node) chtimes(ctx context.Context, in *fuse.SetAttrIn) syscall.Errno {
 		}
 	}
 
-	return toErrno(contextual.Chtimes(ctx, n.fsys, n.path, at, mt))
+	err := contextual.Chtimes(ctx, n.fsys, n.path, at, mt)
+	if err != nil {
+		n.logger.Error("Chtimes failed", "path", n.path, "error", err)
+	}
+	return toErrno(err)
 }
 
 func (n *node) truncate(ctx context.Context, in *fuse.SetAttrIn) syscall.Errno {
@@ -314,5 +364,9 @@ func (n *node) truncate(ctx context.Context, in *fuse.SetAttrIn) syscall.Errno {
 	if !ok {
 		return 0
 	}
-	return toErrno(contextual.Truncate(ctx, n.fsys, n.path, int64(size)))
+	err := contextual.Truncate(ctx, n.fsys, n.path, int64(size))
+	if err != nil {
+		n.logger.Error("Truncate failed", "path", n.path, "error", err)
+	}
+	return toErrno(err)
 }
