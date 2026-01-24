@@ -41,7 +41,7 @@ func (fh *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Re
 
 	if ra, ok := fh.f.(io.ReaderAt); ok {
 		n, err := ra.ReadAt(dest, off)
-		if !errors.Is(err, errors.ErrUnsupported) {
+		if err != errors.ErrUnsupported {
 			if err != nil && err != io.EOF {
 				fh.logger.Error("ReadAt failed", "offset", off, "error", err)
 				return nil, toErrno(err)
@@ -51,16 +51,19 @@ func (fh *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Re
 	}
 
 	if s, ok := fh.f.(io.Seeker); ok {
-		if _, err := s.Seek(off, io.SeekStart); err != nil {
-			fh.logger.Error("Seek failed", "offset", off, "error", err)
-			return nil, toErrno(err)
+		_, err := s.Seek(off, io.SeekStart)
+		if err != errors.ErrUnsupported {
+			if err != nil {
+				fh.logger.Error("Seek failed", "offset", off, "error", err)
+				return nil, toErrno(err)
+			}
+			n, err := fh.f.Read(dest)
+			if err != nil && err != io.EOF {
+				fh.logger.Error("Read failed after seek", "offset", off, "error", err)
+				return nil, toErrno(err)
+			}
+			return fuse.ReadResultData(dest[:n]), 0
 		}
-		n, err := fh.f.Read(dest)
-		if err != nil && err != io.EOF {
-			fh.logger.Error("Read failed after seek", "offset", off, "error", err)
-			return nil, toErrno(err)
-		}
-		return fuse.ReadResultData(dest[:n]), 0
 	}
 
 	if off < fh.offset {
